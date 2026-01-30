@@ -1,100 +1,118 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any, List
-import json
-
+from pydantic import BaseModel, Field
+from typing import Any, Dict, Optional, List
 from bedrock_client import call_llm
+import json
+import re
 
-app = FastAPI()
+app = FastAPI(title="Compliance Autofill Engine", version="0.1.0")
+
+
+class AutofillRequest(BaseModel):
+    advisor_notes: str = Field(..., min_length=5)
+    client_profile: Optional[Dict[str, Any]] = None
+    form_type: str = Field(..., min_length=3)
+
+
+class AutofillResponse(BaseModel):
+    form_type: str
+    autofilled_fields: Dict[str, Any]
+    missing_fields: List[str]
+    risk_flags: List[str]
+    explanations: Dict[str, str]
+
 
 @app.get("/")
 def root():
-    return {"message": "Go to /docs"}
+    return {"status": "ok", "service": "compliance-autofill-engine"}
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.post("/health/bedrock")
 def health_bedrock():
-    out = call_llm('Return only JSON: {"ok":"true","tool":"bedrock"}')
-    return {"model_output": out}
+    try:
+        out = call_llm("Reply with exactly: BEDROCK_OK")
+        return {"status": "ok", "model_reply": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bedrock failed: {e}")
 
 
-# ---------- Autofill MVP ----------
+def _extract_json(text: str) -> Dict[str, Any]:
+    """
+    Claude sometimes returns extra text. This tries:
+    1) direct json.loads
+    2) extract first {...} block and loads it
+    """
+    t = text.strip()
 
-class AutofillRequest(BaseModel):
-    advisor_notes: str
-    client_profile: Dict[str, Any] = {}
-    form_type: str = "generic_disclosure"  # you can add more later
+    # direct parse
+    if t.startswith("{"):
+        return json.loads(t)
+
+    # find a JSON object in the output
+    m = re.search(r"\{.*\}", t, flags=re.DOTALL)
+    if m:
+        return json.loads(m.group(0))
+
+    raise ValueError("No JSON object found in model output")
 
 
-class RiskFlag(BaseModel):
-    field: str
-    issue: str
-
-
-class AutofillResponse(BaseModel):
-    filled_fields: Dict[str, str]
-    missing_fields: List[str]
-    risk_flags: List[Dict[str, str]]
-    citations: Dict[str, List[str]]
-
-
-AUTOFILL_SYSTEM_PROMPT = """
-You are a compliance assistant for financial advisors.
-Your job: turn advisor notes + client profile into a partially completed compliance disclosure.
-
-Rules:
-- Output MUST be valid JSON only. No markdown, no explanations outside JSON.
-- Use exactly these top-level keys:
-  filled_fields (object of string->string),
-  missing_fields (array of strings),
-  risk_flags (array of objects {field, issue}),
-  citations (object of string->array of strings)
-- Be conservative: if information is not present, add it to missing_fields.
-- In citations, use only these sources:
-  "advisor_notes" or "client_profile".
-"""
-
-@app.post("/autofill")
+@app.post("/autofill", response_model=AutofillResponse)
 def autofill(req: AutofillRequest):
-    user_prompt = f"""
-Advisor notes:
-{req.advisor_notes}
+    prompt = f"""
+You are a financial compliance assistant.
 
-Client profile (JSON):
-{json.dumps(req.client_profile, indent=2)}
+Return ONLY valid JSON (no markdown, no extra text).
+Follow this exact JSON schema:
 
-Form type: {req.form_type}
+{{
+  "form_type": "{req.form_type}",
+  "autofilled_fields": {{
+    "client_age": 0,
+    "time_horizon_years": 0,
+    "risk_tolerance": "",
+    "primary_goal": "",
+    "recommended_action_summary": "",
+    "risk_disclosure_summary": ""
+  }},
+  "missing_fields": ["..."],
+  "risk_flags": ["..."],
+  "explanations": {{
+    "client_age": "",
+    "time_horizon_years": "",
+    "risk_tolerance": "",
+    "primary_goal": "",
+    "recommended_action_summary": "",
+    "risk_disclosure_summary": ""
+  }}
+}}
 
-Return JSON with:
-- filled_fields: suggested compliant text for relevant fields (short)
-- missing_fields: what you still need
-- risk_flags: any conflicts (example: conservative risk tolerance + aggressive strategy)
-- citations: for each filled field, list ["advisor_notes"] and/or ["client_profile"]
+RULES:
+- Use advisor_notes + client_profile when available.
+- "missing_fields" should list fields usually required for suitability/compliance that are not present.
+- "risk_flags" should identify potential compliance issues (e.g. mismatch between risk tolerance and product).
+- Keep explanations short and clear.
+
+INPUT:
+advisor_notes: {req.advisor_notes}
+client_profile: {req.client_profile}
 """
 
     try:
-        raw = call_llm(AUTOFILL_SYSTEM_PROMPT + "\n\n" + user_prompt)
+        raw = call_llm(prompt)
+        data = _extract_json(raw)
+
+        # minimal guardrails so the response always matches schema
+        data.setdefault("form_type", req.form_type)
+        data.setdefault("autofilled_fields", {})
+        data.setdefault("missing_fields", [])
+        data.setdefault("risk_flags", [])
+        data.setdefault("explanations", {})
+
+        return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM call failed: {e}")
-
-    # Try to parse JSON. If the model returns extra text, this will fail (good to catch early).
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Model did not return valid JSON. Raw output: {raw}"
-        )
-
-    # Light validation of keys
-    required = {"filled_fields", "missing_fields", "risk_flags", "citations"}
-    if not required.issubset(set(parsed.keys())):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Model JSON missing required keys. Got keys: {list(parsed.keys())}"
-        )
-
-    return parsed
