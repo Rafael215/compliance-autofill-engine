@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import json
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 
 from bedrock_client import call_llm
 
 app = FastAPI(title="Compliance Autofill Engine", version="0.2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # =========================
@@ -265,3 +275,50 @@ POLICY EXCERPTS:
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM call failed: {e}")
+
+
+def _extract_pdf_text(upload: UploadFile) -> str:
+    data = upload.file.read()
+    if not data:
+        return ""
+    reader = PdfReader(BytesIO(data))
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return " ".join(pages).strip()
+
+
+@app.post("/autofill-from-pdf", response_model=AutofillResponse)
+def autofill_from_pdf(
+    file: UploadFile = File(...),
+    form_type: str = Form(...),
+    client_profile: Optional[str] = Form(None),
+    advisor_notes: Optional[str] = Form(None),
+    use_policy_docs: bool = Form(True),
+    top_k_docs: int = Form(4),
+):
+    if file.content_type not in {"application/pdf"} and not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    try:
+        pdf_text = _extract_pdf_text(file)
+        profile: Optional[Dict[str, Any]] = None
+        if client_profile:
+            profile = json.loads(client_profile)
+
+        combined_notes = "\n\n".join([s for s in [advisor_notes, pdf_text] if s])
+        if not combined_notes:
+            raise HTTPException(status_code=400, detail="No text found in PDF or notes.")
+
+        req = AutofillRequest(
+            advisor_notes=combined_notes,
+            client_profile=profile,
+            form_type=form_type,
+            use_policy_docs=use_policy_docs,
+            top_k_docs=top_k_docs,
+        )
+        return autofill(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF autofill failed: {e}")
