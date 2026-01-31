@@ -1,0 +1,25 @@
+import { useEffect, useMemo, useState } from "react";
+
+export default function WorkspacePage() {
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [editedValue, setEditedValue] = useState<string>(MOCK_REVIEW_ITEMS[0]?.value ?? "");
+
+  const currentItem = MOCK_REVIEW_ITEMS[currentIndex];
+  const isDone = currentIndex >= MOCK_REVIEW_ITEMS.length;
+
+  useEffect(() => {
+    if (currentItem) setEditedValue(currentItem.value);
+  }, [currentIndex]);
+
+  return (
+    <>
+      {/* Other JSX */}
+      <textarea
+        style={{ ...styles.valueBox, width: "100%", minHeight: 90, resize: "vertical" }}
+        value={editedValue}
+        onChange={(e) => setEditedValue(e.target.value)}
+      />
+      {/* Other JSX */}
+    </>
+  );
+}
