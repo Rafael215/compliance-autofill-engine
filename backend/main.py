@@ -10,17 +10,30 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+import logging
+import traceback
 
 from bedrock_client import call_llm
 
 app = FastAPI(title="Compliance Autofill Engine", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"],
+    # Vite will often hop ports (5173 -> 5174, etc.) if one is taken.
+    # Allow localhost on any port for hackathon/dev reliability.
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+logger = logging.getLogger("uvicorn.error")
 
 
 # =========================
@@ -270,6 +283,86 @@ def reload_docs():
     return {"status": "ok", "chunks_loaded": len(_DOC_CHUNKS), "chunks_path": str(CHUNKS_PATH)}
 
 
+@app.post("/debug/parse_two_pdfs")
+async def debug_parse_two_pdfs(
+    client_pdf: UploadFile = File(...),
+    notes_pdf: UploadFile = File(...),
+):
+    """Sanity-check endpoint: uploads TWO PDFs and returns extracted text previews."""
+    client_bytes = await client_pdf.read()
+    notes_bytes = await notes_pdf.read()
+
+    client_text = _extract_pdf_text_bytes(client_bytes)
+    notes_text = _extract_pdf_text_bytes(notes_bytes)
+
+    return {
+        "client_filename": client_pdf.filename,
+        "notes_filename": notes_pdf.filename,
+        "client_text_len": len(client_text),
+        "notes_text_len": len(notes_text),
+        "client_text_preview": client_text[:1200],
+        "notes_text_preview": notes_text[:1200],
+    }
+
+
+@app.post("/autofill_two_pdfs")
+async def autofill_two_pdfs(
+    client_pdf: UploadFile = File(...),
+    notes_pdf: UploadFile = File(...),
+    form_type: str = Form("Reg BI suitability summary"),
+    use_policy_docs: str = Form("true"),
+    top_k_docs: str = Form("3"),
+):
+    """
+    Upload TWO PDFs (client profile + meeting notes) and return:
+    - document_text: single editable blob for the left big box
+    - autofilled_fields/explanations/etc for the review panel
+    """
+    try:
+        client_bytes = await client_pdf.read()
+        notes_bytes = await notes_pdf.read()
+
+        client_text = _extract_pdf_text_bytes(client_bytes)
+        notes_text = _extract_pdf_text_bytes(notes_bytes)
+
+        # Parse form fields
+        use_docs = str(use_policy_docs).lower() in {"1", "true", "yes", "y"}
+        try:
+            k = int(str(top_k_docs))
+        except Exception:
+            k = 3
+
+        # Keep small to reduce latency + avoid LLM truncation
+        k = max(1, min(k, 5))
+
+        # Reuse your existing LLM JSON autofill flow.
+        # Put client PDF raw text into client_profile so model can cite it.
+        req = AutofillRequest(
+            advisor_notes=notes_text or "(no meeting notes text extracted)",
+            client_profile={"raw_text": client_text},
+            form_type=form_type,
+            use_policy_docs=use_docs,
+            top_k_docs=k,
+        )
+
+        data = autofill(req)
+
+        fields = data.get("autofilled_fields") or {}
+        risk_flags = data.get("risk_flags") or []
+        document_text = _build_document_text(form_type, fields, risk_flags)
+
+        return {
+            "document_text": document_text,
+            **data,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Log full traceback to the backend terminal for easier debugging from the frontend.
+        logger.error("/autofill_two_pdfs failed: %s\n%s", e, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Two-PDF autofill failed: {e}")
+
 # Load docs at startup
 _load_chunks()
 
@@ -287,7 +380,8 @@ def autofill(req: AutofillRequest):
 
     retrieved = []
     if req.use_policy_docs:
-        retrieved = retrieve_policy_context(retrieval_query, k=req.top_k_docs)
+        safe_k = max(1, min(int(req.top_k_docs or 4), 5))
+        retrieved = retrieve_policy_context(retrieval_query, k=safe_k)
 
     retrieved_block = "\n\n".join(
         [f"SOURCE_ID: {cid}\nEXCERPT: {ctxt}" for cid, ctxt in retrieved]
@@ -304,35 +398,39 @@ Return ONLY valid JSON (no markdown, no extra text).
   - explanations: max 1 short sentence per field (<= 120 chars)
   - risk_flags: max 5 items
   - missing_fields: max 10 items
+  - citations: max 1 item per field
 Follow this exact JSON schema:
 
 {{
-  \"form_type\": \"{req.form_type}\",
-  \"autofilled_fields\": {{
-    \"client_age\": 0,
-    \"time_horizon_years\": 0,
-    \"risk_tolerance\": \"\",
-    \"primary_goal\": \"\",
-    \"recommended_action_summary\": \"\",
-    \"risk_disclosure_summary\": \"\"
+  "form_type": "{req.form_type}",
+  "autofilled_fields": {{
+    "client_name": "",
+    "client_age": 0,
+    "time_horizon_years": 0,
+    "risk_tolerance": "",
+    "primary_goal": "",
+    "recommended_action_summary": "",
+    "risk_disclosure_summary": ""
   }},
-  \"missing_fields\": [\"...\"],
-  \"risk_flags\": [\"...\"],
-  \"explanations\": {{
-    \"client_age\": \"\",
-    \"time_horizon_years\": \"\",
-    \"risk_tolerance\": \"\",
-    \"primary_goal\": \"\",
-    \"recommended_action_summary\": \"\",
-    \"risk_disclosure_summary\": \"\"
+  "citations": {{
+    "client_name": [],
+    "client_age": [],
+    "time_horizon_years": [],
+    "risk_tolerance": [],
+    "primary_goal": [],
+    "recommended_action_summary": [],
+    "risk_disclosure_summary": []
   }},
-  \"citations\": {{
-    \"client_age\": [],
-    \"time_horizon_years\": [],
-    \"risk_tolerance\": [],
-    \"primary_goal\": [],
-    \"recommended_action_summary\": [],
-    \"risk_disclosure_summary\": []
+  "missing_fields": ["..."],
+  "risk_flags": ["..."],
+  "explanations": {{
+    "client_name": "",
+    "client_age": "",
+    "time_horizon_years": "",
+    "risk_tolerance": "",
+    "primary_goal": "",
+    "recommended_action_summary": "",
+    "risk_disclosure_summary": ""
   }}
 }}
 
@@ -343,8 +441,8 @@ RULES:
 - risk_flags should identify potential compliance issues (e.g. mismatch between risk tolerance and recommendation).
 - citations must be a list of strings for each field.
   Allowed citation strings are only:
-  - \"advisor_notes\"
-  - \"client_profile\"
+  - "advisor_notes"
+  - "client_profile"
   - any SOURCE_ID from POLICY EXCERPTS (exactly as shown)
 - If you did not use a source for a field, leave its citations list empty.
 
@@ -368,7 +466,8 @@ POLICY EXCERPTS:
                 "- JSON only (no markdown/backticks)\n"
                 "- No trailing commas\n"
                 "- Keep explanations <= 160 chars each\n"
-                "- citations values must always be JSON arrays (even if empty)\n\n"
+                "- citations values must always be JSON arrays (even if empty)\n"
+                "- citations: max 1 item per field\n\n"
                 f"PREVIOUS_OUTPUT (for reference):\n{bad}\n"
             )
 
@@ -409,7 +508,8 @@ POLICY EXCERPTS:
                 continue
 
         if not data:
-            raise ValueError(f"Model did not return valid JSON after retries. Raw output: {last_raw[:2000]}")
+            # Last-ditch fallback to prevent frontend hard-failure when output truncates.
+            data = _fallback_parse_llm_output(last_raw, req.form_type)
 
         # minimal guardrails so the response always matches schema
         data.setdefault("form_type", req.form_type)
@@ -421,6 +521,7 @@ POLICY EXCERPTS:
 
         # ensure citations keys exist for known fields and are always lists
         for key in [
+            "client_name",
             "client_age",
             "time_horizon_years",
             "risk_tolerance",
@@ -439,16 +540,102 @@ POLICY EXCERPTS:
         raise HTTPException(status_code=500, detail=f"LLM call failed: {e}")
 
 
-def _extract_pdf_text(upload: UploadFile) -> str:
-    data = upload.file.read()
+
+def _clean_pdf_text(t: str) -> str:
+    if not t:
+        return ""
+    # Replace null bytes
+    t = t.replace("\x00", " ")
+
+    # Join hyphenated line breaks: mar-\nket -> market
+    t = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", t)
+
+    # If a newline splits words, turn it into a space
+    t = re.sub(r"(?<=\w)\s*\n\s*(?=\w)", " ", t)
+
+    # Collapse remaining newlines to spaces
+    t = re.sub(r"\n+", " ", t)
+
+    # Collapse all other whitespace into single spaces
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def _extract_pdf_text_bytes(data: bytes) -> str:
     if not data:
         return ""
     reader = PdfReader(BytesIO(data))
     pages = []
     for page in reader.pages:
         pages.append(page.extract_text() or "")
-    return " ".join(pages).strip()
+    raw = "\n".join(pages)
+    return _clean_pdf_text(raw)
 
+
+def _extract_pdf_text(upload: UploadFile) -> str:
+    # For sync endpoints that already read from the file handle
+    data = upload.file.read()
+    return _extract_pdf_text_bytes(data)
+
+def _build_document_text(form_type: str, fields: Dict[str, Any], risk_flags: List[str]) -> str:
+    """Create a single editable text document for the frontend big box."""
+
+    lines: List[str] = []
+
+    # ===== Header Block (Real Compliance Style) =====
+    client_name = "" if fields.get("client_name") is None else str(fields.get("client_name"))
+    lines.append(f"Client Name: {client_name}")
+    lines.append("Advisor Name: ")
+    lines.append("Account Type: ")
+    lines.append("Date: ")
+    lines.append(f"Form Type: {form_type}")
+    lines.append("")
+    lines.append("====================================")
+    lines.append("")
+
+    # ===== Title =====
+    lines.append("=== Autofilled Compliance Form (Editable) ===")
+    lines.append("")
+
+    preferred_order = [
+        "client_name",
+        "client_age",
+        "time_horizon_years",
+        "risk_tolerance",
+        "primary_goal",
+        "recommended_action_summary",
+        "risk_disclosure_summary",
+    ]
+
+    seen = set()
+
+    for k in preferred_order:
+        if k in fields:
+            label = k.replace("_", " ").title()
+            v = fields.get(k)
+            vv = "" if v is None else str(v)
+            lines.append(f"{label}: {vv}")
+            seen.add(k)
+
+    # Any extra keys
+    for k, v in fields.items():
+        if k in seen:
+            continue
+        label = str(k).replace("_", " ").title()
+        vv = "" if v is None else str(v)
+        lines.append(f"{label}: {vv}")
+
+    # ===== Risk Flags =====
+    if risk_flags:
+        lines.append("")
+        lines.append("=== Risk Flags ===")
+        for rf in risk_flags[:10]:
+            lines.append(f"- {rf}")
+
+    lines.append("")
+    lines.append("Notes: Edit anything above before exporting/submitting.")
+
+    return "\n".join(lines)
 
 @app.post("/autofill-from-pdf", response_model=AutofillResponse)
 def autofill_from_pdf(
@@ -484,3 +671,89 @@ def autofill_from_pdf(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF autofill failed: {e}")
+
+def _extract_first_json_array(text: str, key: str) -> Optional[List[Any]]:
+    """Best-effort extraction of a JSON array value for a given key from raw text."""
+    if not text or not key:
+        return None
+    # Look for: "key": [ ... ]
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*(\[.*?\])', text, flags=re.DOTALL)
+    if not m:
+        return None
+    arr_raw = m.group(1)
+    # light repair (remove trailing commas)
+    arr_raw = re.sub(r",\s*(\])", r"\1", arr_raw)
+    try:
+        val = json.loads(arr_raw)
+        return val if isinstance(val, list) else None
+    except Exception:
+        return None
+
+
+def _extract_first_json_object(text: str, key: str) -> Optional[Dict[str, Any]]:
+    """Best-effort extraction of a JSON object value for a given key from raw text."""
+    if not text or not key:
+        return None
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*(\{{.*?\}})\s*(,\s*"|\s*\}}\s*$)', text, flags=re.DOTALL)
+    if not m:
+        return None
+    obj_raw = m.group(1)
+    obj_raw = re.sub(r",\s*([}\]])", r"\1", obj_raw)
+    obj_raw = obj_raw.replace("“", '"').replace("”", '"').replace("’", "'")
+    try:
+        val = json.loads(obj_raw)
+        return val if isinstance(val, dict) else None
+    except Exception:
+        return None
+
+
+def _fallback_parse_llm_output(raw: str, form_type: str) -> Dict[str, Any]:
+    """Last-ditch fallback when the model output is truncated and JSON parsing fails.
+
+    Extracts what it can via regex and fills the rest with safe defaults.
+    This prevents the frontend from hard-failing on occasional truncation.
+    """
+    raw = _strip_code_fences((raw or "").strip())
+
+    fields = _extract_first_json_object(raw, "autofilled_fields") or {}
+    explanations = _extract_first_json_object(raw, "explanations") or {}
+
+    missing_fields = _extract_first_json_array(raw, "missing_fields") or []
+    risk_flags = _extract_first_json_array(raw, "risk_flags") or []
+
+    # citations often truncates last; default to empty lists
+    citations = _extract_first_json_object(raw, "citations") or {}
+
+    data: Dict[str, Any] = {
+        "form_type": form_type,
+        "autofilled_fields": fields,
+        "missing_fields": missing_fields,
+        "risk_flags": risk_flags,
+        "explanations": explanations,
+        "citations": citations,
+    }
+
+    # Ensure schema keys exist
+    for key in [
+        "client_name",
+        "client_age",
+        "time_horizon_years",
+        "risk_tolerance",
+        "primary_goal",
+        "recommended_action_summary",
+        "risk_disclosure_summary",
+    ]:
+        data["autofilled_fields"].setdefault(key, "" if key in {"client_name", "risk_tolerance", "primary_goal", "recommended_action_summary", "risk_disclosure_summary"} else 0)
+        data["explanations"].setdefault(key, "")
+        cval = data["citations"].get(key, [])
+        if not isinstance(cval, list):
+            cval = []
+        data["citations"][key] = cval
+
+    # If the model itself flagged a field missing, keep it (but ensure list type)
+    if not isinstance(data["missing_fields"], list):
+        data["missing_fields"] = []
+    if not isinstance(data["risk_flags"], list):
+        data["risk_flags"] = []
+
+    return data
