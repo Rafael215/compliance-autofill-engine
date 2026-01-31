@@ -31,6 +31,8 @@ pydantic_core==2.41.5
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
+python-multipart==0.0.12
+pypdf==6.6.2
 python-pptx==1.0.2
 pytz==2025.2
 s3transfer==0.16.0
