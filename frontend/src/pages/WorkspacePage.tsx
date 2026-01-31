@@ -26,14 +26,16 @@ const MOCK_REVIEW_ITEMS: ReviewItem[] = [
 ];
 
 export default function WorkspacePage() {
-  const [docUrl, setDocUrl] = useState<string | null>(null);
-  const [jsonText, setJsonText] = useState<string | null>(null);
+  const [docText, setDocText] = useState<string>("");
+  const [meetingFile, setMeetingFile] = useState<File | null>(null);
+  const [profileFile, setProfileFile] = useState<File | null>(null);
   const [reviewItems, setReviewItems] = useState<ReviewItem[]>(MOCK_REVIEW_ITEMS);
   const [isLoading, setIsLoading] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [editedValue, setEditedValue] = useState<string>(reviewItems[0]?.value ?? "");
   const [savedByIndex, setSavedByIndex] = useState<Record<number, string>>({});
+  const [savedDocTextByIndex, setSavedDocTextByIndex] = useState<Record<number, string>>({});
 
   const styles = useMemo(
     () => ({
@@ -113,6 +115,11 @@ export default function WorkspacePage() {
         gap: 16,
         alignItems: "start",
       } as const,
+      sideColumn: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 16,
+      } as const,
       card: {
         background: "white",
         border: "1px solid #e5e7eb",
@@ -150,6 +157,18 @@ export default function WorkspacePage() {
       } as const,
       viewerBody: {
         height: "100%",
+      } as const,
+      docEditor: {
+        width: "100%",
+        height: "100%",
+        border: "none",
+        padding: 16,
+        resize: "none",
+        fontSize: 13,
+        lineHeight: 1.4,
+        color: "#081D4D",
+        background: "transparent",
+        fontFamily: "inherit",
       } as const,
       viewerEmpty: {
         padding: 18,
@@ -201,19 +220,6 @@ export default function WorkspacePage() {
         color: "white",
         border: "1px solid #081D4D",
       } as const,
-      pre: {
-        padding: 16,
-        margin: 0,
-        height: "100%",
-        overflow: "auto",
-        fontSize: 12,
-        lineHeight: 1.4,
-      } as const,
-      iframe: {
-        width: "100%",
-        height: "100%",
-        border: "none",
-      } as const,
       footerHint: {
         marginTop: 12,
         fontSize: 12,
@@ -225,8 +231,12 @@ export default function WorkspacePage() {
 
   const currentItem = reviewItems[currentIndex];
   const isDone = currentIndex >= reviewItems.length;
+  const hasBothUploads = Boolean(meetingFile && profileFile);
+  const hasUpload = hasBothUploads;
   const isSavedForCurrent =
-    !isDone && savedByIndex[currentIndex] !== undefined && savedByIndex[currentIndex] === editedValue;
+    !isDone &&
+    savedDocTextByIndex[currentIndex] !== undefined &&
+    savedDocTextByIndex[currentIndex] === docText;
 
   useEffect(() => {
     if (!currentItem) return;
@@ -234,69 +244,74 @@ export default function WorkspacePage() {
     setEditedValue(saved !== undefined ? saved : currentItem.value);
   }, [currentIndex, savedByIndex, currentItem]);
 
-  async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleUpload(
+    e: React.ChangeEvent<HTMLInputElement>,
+    source: "meeting" | "profile"
+  ) {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // JSON: read and pretty-print
-    if (file.type === "application/json" || file.name.toLowerCase().endsWith(".json")) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        try {
-          const parsed = JSON.parse(String(reader.result));
-          setJsonText(JSON.stringify(parsed, null, 2));
-          setDocUrl(null);
-        } catch {
-          alert("Invalid JSON file");
-        }
-      };
-      reader.readAsText(file);
-      return;
+    if (source === "meeting") {
+      setMeetingFile(file);
+    } else {
+      setProfileFile(file);
     }
 
-    // Otherwise (e.g., PDF): use object URL for preview
-    setDocUrl(URL.createObjectURL(file));
-    setJsonText(null);
+    setDocText("");
+    setSavedDocTextByIndex({});
+  }
 
-    setIsLoading(true);
-    setErrorText(null);
+  useEffect(() => {
+    if (!meetingFile || !profileFile) return;
 
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("form_type", "Form CRS");
+    const runAutofill = async () => {
+      setIsLoading(true);
+      setErrorText(null);
 
-      const resp = await fetch("http://localhost:8000/autofill-from-pdf", {
-        method: "POST",
-        body: formData,
-      });
+      try {
+        const formData = new FormData();
+        formData.append("client_pdf", profileFile);
+        formData.append("notes_pdf", meetingFile);
+        formData.append("form_type", "Reg BI suitability summary");
+        formData.append("use_policy_docs", "true");
+        formData.append("top_k_docs", "3");
 
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(text || "Autofill request failed");
-      }
+        const resp = await fetch("http://127.0.0.1:8000/autofill_two_pdfs", {
+          method: "POST",
+          body: formData,
+        });
 
-      const data = await resp.json();
-      const fields = data?.autofilled_fields ?? {};
-      const explanations = data?.explanations ?? {};
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(text || "Autofill request failed");
+        }
 
-      const nextItems: ReviewItem[] = Object.entries(fields).map(([key, value]) => ({
-        label: key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
-        value: value === null || value === undefined ? "" : String(value),
-        reason: explanations[key] || "Generated by AI",
-      }));
+        const data = await resp.json();
+        setDocText(typeof data?.document_text === "string" ? data.document_text : "");
+        const fields = data?.autofilled_fields ?? {};
+        const explanations = data?.explanations ?? {};
 
-      setReviewItems(nextItems.length ? nextItems : MOCK_REVIEW_ITEMS);
-      setCurrentIndex(0);
-      setSavedByIndex({});
+        const nextItems: ReviewItem[] = Object.entries(fields).map(([key, value]) => ({
+          label: key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+          value: value === null || value === undefined ? "" : String(value),
+          reason: explanations[key] || "Generated by AI",
+        }));
+
+        setReviewItems(nextItems.length ? nextItems : MOCK_REVIEW_ITEMS);
+        setCurrentIndex(0);
+        setSavedByIndex({});
       setEditedValue(nextItems[0]?.value ?? "");
+      setSavedDocTextByIndex({});
     } catch (err) {
       setErrorText(err instanceof Error ? err.message : "Autofill request failed");
       setReviewItems(MOCK_REVIEW_ITEMS);
-    } finally {
-      setIsLoading(false);
-    }
-  }
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    runAutofill();
+  }, [meetingFile, profileFile]);
 
   function handleClear() {
     setEditedValue("");
@@ -305,6 +320,7 @@ export default function WorkspacePage() {
   function handleSave() {
     if (isDone) return;
     setSavedByIndex((prev) => ({ ...prev, [currentIndex]: editedValue }));
+    setSavedDocTextByIndex((prev) => ({ ...prev, [currentIndex]: docText }));
   }
 
   function handleBackStep() {
@@ -324,7 +340,7 @@ export default function WorkspacePage() {
           <div style={styles.titleWrap}>
             <h1 style={styles.title}>Compliance Autofill Review</h1>
             <p style={styles.subtitle}>
-              Upload a PDF or JSON, edit the suggestion, then click Save to enable Next.
+              Upload both PDFs, edit the suggestion, then click Save to enable Next.
             </p>
           </div>
 
@@ -368,89 +384,118 @@ export default function WorkspacePage() {
           <div style={{ ...styles.card, ...styles.viewer }}>
             <div style={styles.cardHeader}>
               <p style={styles.cardTitle}>Document</p>
-              <div style={styles.uploadRow}>
-                <input
-                  style={styles.input}
-                  type="file"
-                  accept="application/pdf,application/json"
-                  onChange={handleUpload}
-                />
-              </div>
             </div>
 
             <div style={styles.viewerBody}>
-              {docUrl ? (
-                <iframe src={docUrl} title="Document" style={styles.iframe} />
-              ) : jsonText ? (
-                <pre style={styles.pre}>{jsonText}</pre>
-              ) : (
+              {!hasBothUploads ? (
                 <div style={styles.viewerEmpty}>
-                  No document uploaded yet. Choose a PDF to preview, or upload JSON to view
-                  structured content.
+                  Upload both Meeting Notes and Client Profile to preview the document.
                 </div>
+              ) : (
+                <textarea
+                  style={styles.docEditor}
+                  value={docText}
+                  onChange={(e) => setDocText(e.target.value)}
+                  placeholder={isLoading ? "Generating document text..." : "Document text will appear here."}
+                  disabled={isLoading}
+                />
               )}
             </div>
           </div>
 
-          {/* Review Panel */}
-          <div style={styles.card}>
-            <div style={styles.cardHeader}>
-              <p style={styles.cardTitle}>Review</p>
-              <span style={styles.stepText}>
-                {isDone ? "0 remaining" : `${reviewItems.length - currentIndex} remaining`}
-              </span>
-            </div>
+          <div style={styles.sideColumn}>
+            {/* Review Panel */}
+            {hasUpload ? (
+              <div style={styles.card}>
+                <div style={styles.cardHeader}>
+                  <p style={styles.cardTitle}>Review</p>
+                  <span style={styles.stepText}>
+                    {isDone ? "0 remaining" : `${reviewItems.length - currentIndex} remaining`}
+                  </span>
+                </div>
 
-            <div style={styles.reviewBody}>
-              {isLoading ? (
-                <>
-                  <h3 style={styles.fieldLabel}>Generating…</h3>
-                  <p style={styles.reason}>Extracting the PDF and running autofill.</p>
-                </>
-              ) : errorText ? (
-                <>
-                  <h3 style={styles.fieldLabel}>Autofill Failed</h3>
-                  <p style={styles.reason}>{errorText}</p>
-                </>
-              ) : !isDone ? (
-                <>
-                  <div style={styles.stepText}>
-                    Review {currentIndex + 1} of {reviewItems.length}
-                  </div>
+                <div style={styles.reviewBody}>
+                  {isLoading ? (
+                    <>
+                      <h3 style={styles.fieldLabel}>Generating…</h3>
+                      <p style={styles.reason}>Extracting the PDF and running autofill.</p>
+                    </>
+                  ) : errorText ? (
+                    <>
+                      <h3 style={styles.fieldLabel}>Autofill Failed</h3>
+                      <p style={styles.reason}>{errorText}</p>
+                    </>
+                  ) : !isDone ? (
+                    <>
+                      <div style={styles.stepText}>
+                        Review {currentIndex + 1} of {reviewItems.length}
+                      </div>
 
-                  <h3 style={styles.fieldLabel}>{currentItem.label}</h3>
-                  <p style={styles.reason}>Reason: {currentItem.reason}</p>
+                      <h3 style={styles.fieldLabel}>{currentItem.label}</h3>
+                      <p style={styles.reason}>Reason: {currentItem.reason}</p>
 
-                  <textarea
-                    style={{ ...styles.valueBox, width: "100%", minHeight: 90, resize: "vertical" }}
-                    value={editedValue}
-                    onChange={(e) => setEditedValue(e.target.value)}
-                  />
+                      <textarea
+                        style={{ ...styles.valueBox, width: "100%", minHeight: 90, resize: "vertical" }}
+                        value={editedValue}
+                        onChange={(e) => setEditedValue(e.target.value)}
+                      />
 
-                  <div style={styles.btnRow}>
-                    <button onClick={handleClear} style={styles.btn}>
-                      Clear
-                    </button>
-                    <button
-                      onClick={isSavedForCurrent ? handleNextStep : handleSave}
-                      style={{ ...styles.btn, ...styles.btnPrimary }}
-                      disabled={isDone}
-                      title={isSavedForCurrent ? "Go to next step" : "Save this field to enable Next"}
-                    >
-                      {isSavedForCurrent ? "Next" : "Save"}
-                    </button>
-                  </div>
+                      <div style={styles.btnRow}>
+                        <button onClick={handleClear} style={styles.btn}>
+                          Clear
+                        </button>
+                        <button
+                          onClick={isSavedForCurrent ? handleNextStep : handleSave}
+                          style={{ ...styles.btn, ...styles.btnPrimary }}
+                          disabled={isDone}
+                          title={isSavedForCurrent ? "Go to next step" : "Save this field to enable Next"}
+                        >
+                          {isSavedForCurrent ? "Next" : "Save"}
+                        </button>
+                      </div>
 
-                  <div style={styles.footerHint}>
-                    Tip: Save each step to unlock Next. Upload JSON to show structured inputs.
-                  </div>
-                </>
-              ) : (
-                <>
-                  <h3 style={styles.fieldLabel}>Review Complete 🎉</h3>
-                  <p style={styles.reason}>All fields have been reviewed.</p>
-                </>
-              )}
+                      <div style={styles.footerHint}>
+                        Tip: Save each step to unlock Next. Upload both PDFs to run autofill.
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <h3 style={styles.fieldLabel}>Review Complete 🎉</h3>
+                      <p style={styles.reason}>All fields have been reviewed.</p>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : null}
+
+            {/* Upload Card */}
+            <div style={styles.card}>
+              <div style={styles.cardHeader}>
+                <p style={styles.cardTitle}>Upload</p>
+              </div>
+              <div style={styles.reviewBody}>
+                <div style={{ ...styles.uploadRow, flexDirection: "column", alignItems: "flex-start", gap: 12 }}>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <span style={styles.stepText}>Meeting Notes</span>
+                    <input
+                      style={styles.input}
+                      type="file"
+                      accept="application/pdf"
+                      onChange={(e) => handleUpload(e, "meeting")}
+                    />
+                  </label>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <span style={styles.stepText}>Client Profile</span>
+                    <input
+                      style={styles.input}
+                      type="file"
+                      accept="application/pdf"
+                      onChange={(e) => handleUpload(e, "profile")}
+                    />
+                  </label>
+                </div>
+                <p style={styles.reason}>Upload both PDFs to run autofill and populate the review.</p>
+              </div>
             </div>
           </div>
         </div>
