@@ -220,6 +220,11 @@ export default function WorkspacePage() {
         color: "white",
         border: "1px solid #081D4D",
       } as const,
+      btnGhost: {
+        background: "#f9fafb",
+        color: "#081D4D",
+        border: "1px dashed #cbd5f5",
+      } as const,
       footerHint: {
         marginTop: 12,
         fontSize: 12,
@@ -323,6 +328,115 @@ export default function WorkspacePage() {
     setSavedDocTextByIndex((prev) => ({ ...prev, [currentIndex]: docText }));
   }
 
+  function handleDownloadPdf() {
+    if (!docText.trim()) {
+      alert("No document text to download yet.");
+      return;
+    }
+
+    const escapePdfText = (value: string) =>
+      value.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+
+    const wrapText = (value: string, maxLen: number) => {
+      const lines: string[] = [];
+      const paragraphs = value.replace(/\r/g, "").split("\n");
+      for (const para of paragraphs) {
+        if (!para) {
+          lines.push("");
+          continue;
+        }
+        let current = "";
+        for (const word of para.split(/\s+/)) {
+          const next = current ? `${current} ${word}` : word;
+          if (next.length > maxLen) {
+            if (current) lines.push(current);
+            current = word;
+          } else {
+            current = next;
+          }
+        }
+        if (current) lines.push(current);
+      }
+      return lines;
+    };
+
+    const buildPdf = (text: string) => {
+      const encoder = new TextEncoder();
+      const pageWidth = 612;
+      const pageHeight = 792;
+      const margin = 50;
+      const lineHeight = 14;
+      const maxLines = Math.floor((pageHeight - margin * 2) / lineHeight);
+      const lines = wrapText(text, 90);
+      const pages: string[][] = [];
+      for (let i = 0; i < lines.length; i += maxLines) {
+        pages.push(lines.slice(i, i + maxLines));
+      }
+
+      const objects: { id: number; body: string }[] = [];
+      const pageCount = Math.max(1, pages.length);
+      const kids = Array.from({ length: pageCount }, (_, i) => `${4 + i * 2} 0 R`).join(" ");
+
+      objects.push({ id: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" });
+      objects.push({ id: 2, body: `<< /Type /Pages /Kids [${kids}] /Count ${pageCount} >>` });
+      objects.push({ id: 3, body: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>" });
+
+      pages.forEach((pageLines, index) => {
+        const pageId = 4 + index * 2;
+        const contentId = 5 + index * 2;
+        const contentLines = pageLines
+          .map((line) => `(${escapePdfText(line)}) Tj T*`)
+          .join("\n");
+        const content = `BT /F1 12 Tf ${lineHeight} TL ${margin} ${pageHeight - margin} Td\n${contentLines}\nET`;
+        const length = encoder.encode(content).length;
+
+        objects.push({
+          id: pageId,
+          body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentId} 0 R >>`,
+        });
+        objects.push({
+          id: contentId,
+          body: `<< /Length ${length} >>\nstream\n${content}\nendstream`,
+        });
+      });
+
+      let pdf = "%PDF-1.4\n";
+      const offsets: number[] = [0];
+      let cursor = encoder.encode(pdf).length;
+
+      objects
+        .sort((a, b) => a.id - b.id)
+        .forEach((obj) => {
+          offsets[obj.id] = cursor;
+          const chunk = `${obj.id} 0 obj\n${obj.body}\nendobj\n`;
+          pdf += chunk;
+          cursor += encoder.encode(chunk).length;
+        });
+
+      const xrefOffset = cursor;
+      const size = objects.length + 1;
+      let xref = `xref\n0 ${size}\n0000000000 65535 f \n`;
+      for (let i = 1; i < size; i += 1) {
+        const offset = String(offsets[i]).padStart(10, "0");
+        xref += `${offset} 00000 n \n`;
+      }
+
+      pdf += `${xref}trailer\n<< /Size ${size} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+      return pdf;
+    };
+
+    const pdf = buildPdf(docText);
+    const blob = new Blob([pdf], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "compliance-document.pdf";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
   function handleBackStep() {
     setCurrentIndex((i) => Math.max(0, i - 1));
   }
@@ -338,7 +452,7 @@ export default function WorkspacePage() {
       <div style={styles.container}>
         <div style={styles.header}>
           <div style={styles.titleWrap}>
-            <h1 style={styles.title}>Compliance Autofill Review</h1>
+            <h1 style={styles.title}>Compliance Autofill Engine</h1>
             <p style={styles.subtitle}>
               Upload both PDFs, edit the suggestion, then click Save to enable Next.
             </p>
@@ -408,7 +522,7 @@ export default function WorkspacePage() {
             {hasUpload ? (
               <div style={styles.card}>
                 <div style={styles.cardHeader}>
-                  <p style={styles.cardTitle}>Review</p>
+                  <p style={styles.cardTitle}>Engine</p>
                   <span style={styles.stepText}>
                     {isDone ? "0 remaining" : `${reviewItems.length - currentIndex} remaining`}
                   </span>
@@ -457,11 +571,31 @@ export default function WorkspacePage() {
                       <div style={styles.footerHint}>
                         Tip: Save each step to unlock Next. Upload both PDFs to run autofill.
                       </div>
+                      <div style={{ ...styles.btnRow, marginTop: 10 }}>
+                        <button
+                          onClick={handleDownloadPdf}
+                          style={{ ...styles.btn, ...styles.btnGhost }}
+                          disabled={!docText.trim()}
+                          title="Open print dialog to save as PDF"
+                        >
+                          Download PDF
+                        </button>
+                      </div>
                     </>
                   ) : (
                     <>
                       <h3 style={styles.fieldLabel}>Review Complete 🎉</h3>
                       <p style={styles.reason}>All fields have been reviewed.</p>
+                      <div style={{ ...styles.btnRow, marginTop: 10 }}>
+                        <button
+                          onClick={handleDownloadPdf}
+                          style={{ ...styles.btn, ...styles.btnGhost }}
+                          disabled={!docText.trim()}
+                          title="Download the final document"
+                        >
+                          Download PDF
+                        </button>
+                      </div>
                     </>
                   )}
                 </div>
