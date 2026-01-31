@@ -1,3 +1,33 @@
-.DS_Store
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+backend/.venv/
 backend/venv*/
+backend/venv311/
+
+# Env secrets
+.env
+
+# Frontend
 frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS / Editor
+.DS_Store
+.vscode/
+
+# Generated indexes / data (if you do NOT want them in git)
+data/
+backend/data/
+backend/index/
+**/*.index
+**/chunks.json
