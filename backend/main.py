@@ -77,20 +77,109 @@ def health_bedrock():
 _JSON_RE = re.compile(r"\{.*\}", flags=re.DOTALL)
 
 
+def _strip_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    # remove ```json ... ``` or ``` ... ``` fences
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", s)
+        s = re.sub(r"\n```$", "", s)
+    return s.strip()
+
+
+def _try_json_loads(s: str) -> Optional[Dict[str, Any]]:
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+        return None
+    except Exception:
+        return None
+
+
+def _json_repair_best_effort(s: str) -> str:
+    """Best-effort cleanup for common LLM JSON issues (hackathon-safe)."""
+    t = (s or "").strip()
+    t = _strip_code_fences(t)
+
+    # If there's leading/trailing junk, extract the first JSON object
+    if not t.startswith("{"):
+        m = _JSON_RE.search(t)
+        if m:
+            t = m.group(0)
+
+    # remove trailing commas before } or ]
+    t = re.sub(r",\s*([}\]])", r"\1", t)
+
+    # normalize smart quotes (rare but happens)
+    t = t.replace("“", '"').replace("”", '"').replace("’", "'")
+
+    return t.strip()
+
+
 def _extract_json(text: str) -> Dict[str, Any]:
-    """Best-effort JSON extraction from a model response."""
-    t = (text or "").strip()
+    """Robust JSON extraction from a model response.
 
-    # direct parse
-    if t.startswith("{"):
-        return json.loads(t)
+    Strategy:
+    1) Strip code fences and try direct JSON parse
+    2) Extract first JSON object and parse
+    3) Apply lightweight repair and parse
+    """
+    raw = (text or "").strip()
+    raw = _strip_code_fences(raw)
 
-    # find first JSON object
-    m = _JSON_RE.search(t)
+    # 1) direct parse
+    direct = _try_json_loads(raw)
+    if direct is not None:
+        return direct
+
+    # 2) extract first JSON object and parse
+    m = _JSON_RE.search(raw)
     if m:
-        return json.loads(m.group(0))
+        extracted = m.group(0)
+        extracted_obj = _try_json_loads(extracted)
+        if extracted_obj is not None:
+            return extracted_obj
 
-    raise ValueError("No JSON object found in model output")
+    # 3) repair and parse
+    repaired = _json_repair_best_effort(raw)
+    repaired_obj = _try_json_loads(repaired)
+    if repaired_obj is not None:
+        return repaired_obj
+
+    raise ValueError(f"Model did not return valid JSON. Raw output: {raw[:2000]}")
+
+
+def _extract_json_largest_valid_prefix(text: str) -> Optional[Dict[str, Any]]:
+    """Try to recover a valid JSON object from a truncated model output.
+
+    We scan for closing braces '}' from the end and attempt to parse the largest
+    prefix that forms a valid JSON object.
+    """
+    raw = (text or "").strip()
+    raw = _strip_code_fences(raw)
+
+    # If there's leading/trailing junk, attempt to start at the first '{'
+    if not raw.startswith("{"):
+        m = _JSON_RE.search(raw)
+        if m:
+            raw = m.group(0)
+
+    # Fast path
+    obj = _try_json_loads(raw)
+    if obj is not None:
+        return obj
+
+    # Try progressively shorter prefixes ending at a '}'
+    for i in range(len(raw) - 1, -1, -1):
+        if raw[i] != "}":
+            continue
+        candidate = raw[: i + 1]
+        candidate = _json_repair_best_effort(candidate)
+        obj = _try_json_loads(candidate)
+        if obj is not None:
+            return obj
+
+    return None
 
 
 def _safe_str(x: Any) -> str:
@@ -99,6 +188,18 @@ def _safe_str(x: Any) -> str:
     if isinstance(x, str):
         return x
     return json.dumps(x, ensure_ascii=False)
+
+
+# =========================
+# Additional Helper
+# =========================
+
+def _looks_truncated_json(s: str) -> bool:
+    """Heuristic: model started a JSON object but didn't finish it."""
+    if not s:
+        return False
+    t = _strip_code_fences(s).strip()
+    return t.startswith("{") and not t.endswith("}")
 
 
 # =========================
@@ -196,6 +297,13 @@ def autofill(req: AutofillRequest):
 You are a financial compliance assistant.
 
 Return ONLY valid JSON (no markdown, no extra text).
+- Never include trailing commas.
+- Never include comments.
+- Never wrap the JSON in triple backticks.
+- Keep outputs SHORT to avoid truncation:
+  - explanations: max 1 short sentence per field (<= 120 chars)
+  - risk_flags: max 5 items
+  - missing_fields: max 10 items
 Follow this exact JSON schema:
 
 {{
@@ -249,8 +357,59 @@ POLICY EXCERPTS:
 """.strip()
 
     try:
-        raw = call_llm(prompt)
-        data = _extract_json(raw)
+        last_raw: str = ""
+        data: Dict[str, Any] = {}
+
+        def _reprint_prompt(bad: str) -> str:
+            return (
+                "You returned output that was invalid or truncated. "
+                "Reprint the FULL JSON object only, matching the exact same schema.\n"
+                "Requirements:\n"
+                "- JSON only (no markdown/backticks)\n"
+                "- No trailing commas\n"
+                "- Keep explanations <= 160 chars each\n"
+                "- citations values must always be JSON arrays (even if empty)\n\n"
+                f"PREVIOUS_OUTPUT (for reference):\n{bad}\n"
+            )
+
+        # Retry a few times because LLMs can intermittently output invalid/truncated JSON
+        for attempt in range(3):
+            last_raw = call_llm(prompt)
+
+            # If it looks truncated, immediately ask for a full reprint
+            if _looks_truncated_json(last_raw):
+                last_raw = call_llm(_reprint_prompt(last_raw))
+
+            # 1) Try normal robust extraction
+            try:
+                data = _extract_json(last_raw)
+                break
+            except Exception:
+                pass
+
+            # 2) If truncated, try to salvage the largest valid JSON prefix
+            recovered = _extract_json_largest_valid_prefix(last_raw)
+            if recovered is not None:
+                data = recovered
+                break
+
+            # 3) Ask the model to FIX/REPRINT its JSON (no new content)
+            last_raw = call_llm(_reprint_prompt(last_raw))
+
+            # Try again
+            try:
+                data = _extract_json(last_raw)
+                break
+            except Exception:
+                recovered = _extract_json_largest_valid_prefix(last_raw)
+                if recovered is not None:
+                    data = recovered
+                    break
+                # continue to next attempt
+                continue
+
+        if not data:
+            raise ValueError(f"Model did not return valid JSON after retries. Raw output: {last_raw[:2000]}")
 
         # minimal guardrails so the response always matches schema
         data.setdefault("form_type", req.form_type)
@@ -260,7 +419,7 @@ POLICY EXCERPTS:
         data.setdefault("explanations", {})
         data.setdefault("citations", {})
 
-        # ensure citations keys exist for known fields
+        # ensure citations keys exist for known fields and are always lists
         for key in [
             "client_age",
             "time_horizon_years",
@@ -269,7 +428,10 @@ POLICY EXCERPTS:
             "recommended_action_summary",
             "risk_disclosure_summary",
         ]:
-            data["citations"].setdefault(key, [])
+            val = data.get("citations", {}).get(key, [])
+            if not isinstance(val, list):
+                val = []
+            data["citations"][key] = val
 
         return data
 
