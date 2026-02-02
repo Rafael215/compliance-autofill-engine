@@ -61,15 +61,25 @@ CAfE is designed to assist advisors, not replace them.
 
 ## 📁 Project Structure
 compliance-autofill-engine/
+
 ├── backend/
+
 │   ├── main.py
+
 │   ├── bedrock_client.py
+
 │   ├── docs_text/
+
 │   ├── requirements.txt
+
 │   └── data/
+
 ├── frontend/
+
 │   ├── src/
+
 │   └── package.json
+
 └── README.md
 
 ---
@@ -79,13 +89,17 @@ compliance-autofill-engine/
 ### Backend
 
 cd backend
+
 python -m venv venv
+
 source venv/bin/activate   # Mac/Linux
 
 ### Frontend
 
 cd frontend
+
 npm install
+
 npm run dev
 
 ---
